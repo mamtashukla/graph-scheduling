@@ -331,6 +331,92 @@ static void topo_sort(const Problem *p, const TensorInfo *info,
     }
 }
 
+static long long ceil_div(long long a, long long b) {
+    return (a + b - 1) / b;
+}
+
+/*
+ * Evaluate the latency of one subgraph.
+ * retained[0..num_retained-1] = tensor ids already resident in fast memory
+ * from the previous subgraph (no load cost for them).
+ */
+static double evaluate_subgraph(const Problem *p, const TensorInfo *info,
+                                 const Subgraph *sg,
+                                 const int *retained, int num_retained) {
+    /* Mark ops inside this subgraph */
+    int in_sg[MAX_OPS] = {0};
+    for (int i = 0; i < sg->num_ops; i++) in_sg[sg->ops[i]] = 1;
+
+    /* Find output tensor shape and MatMul K depth in one pass */
+    long long tensor_W = 0, tensor_H = 0, full_K = 1;
+    for (int i = 0; i < sg->num_ops; i++) {
+        int op = sg->ops[i];
+        if (tensor_W == 0) {
+            for (int n = 0; n < p->ops[op].num_outputs; n++) {
+                int t = p->ops[op].outputs[n];
+                int ext = info[t].is_graph_output;
+                for (int c = 0; !ext && c < info[t].num_consumers; c++)
+                    ext = !in_sg[info[t].consumers[c]];
+                if (ext) { tensor_W = p->tensors[t].width;
+                           tensor_H = p->tensors[t].height; break; }
+            }
+        }
+        if (full_K == 1 && p->ops[op].op_type == OP_MATMUL)
+            full_K = p->tensors[p->ops[op].inputs[0]].width;
+    }
+
+    long long w = sg->gran.w, h = sg->gran.h, k = sg->gran.k;
+    long long total_steps = ceil_div(tensor_W, w) * ceil_div(tensor_H, h)
+                          * ceil_div(full_K, k);
+
+    double spatial_overhead =
+        (w < p->native_granularity.w || h < p->native_granularity.h)
+        ? (double)(p->native_granularity.w * p->native_granularity.h) / (double)(w * h)
+        : 1.0;
+
+    double compute = 0.0, mem_bytes = 0.0;
+    for (int i = 0; i < sg->num_ops; i++) {
+        int op = sg->ops[i];
+
+        /* Compute cost per step */
+        double cost = (double)p->ops[op].base_cost * spatial_overhead;
+        if (p->ops[op].op_type == OP_MATMUL)
+            cost *= (double)k / (double)full_K;
+        compute += cost;
+
+        /* Boundary inputs: load from slow memory unless retained */
+        for (int n = 0; n < p->ops[op].num_inputs; n++) {
+            int t = p->ops[op].inputs[n];
+            if (info[t].producer >= 0 && in_sg[info[t].producer]) continue;
+            int skip = 0;
+            for (int r = 0; r < num_retained; r++)
+                if (retained[r] == t) { skip = 1; break; }
+            if (skip) continue;
+            mem_bytes += (p->ops[op].op_type == OP_MATMUL)
+                         ? (double)((n == 0) ? h * k : k * w)
+                         : (double)(w * h);
+        }
+
+        /* Boundary outputs: store to slow memory unless retained */
+        for (int n = 0; n < p->ops[op].num_outputs; n++) {
+            int t = p->ops[op].outputs[n];
+            int ext = info[t].is_graph_output;
+            for (int c = 0; !ext && c < info[t].num_consumers; c++)
+                ext = !in_sg[info[t].consumers[c]];
+            if (!ext) continue;
+            int kept = 0;
+            for (int r = 0; r < sg->num_retain; r++)
+                if (sg->tensors_to_retain[r] == t) { kept = 1; break; }
+            if (kept) continue;
+            mem_bytes += (double)(w * h);
+        }
+    }
+
+    double mem_time = mem_bytes / (double)p->slow_memory_bandwidth;
+    double lat_per_step = (compute > mem_time) ? compute : mem_time;
+    return lat_per_step * (double)total_steps;
+}
+
 static Solution schedule_baseline(const Problem *p, const TensorInfo *info) {
     Solution sol;
     memset(&sol, 0, sizeof(sol));
@@ -355,10 +441,10 @@ static Solution schedule_baseline(const Problem *p, const TensorInfo *info) {
             sg->gran.k = 1;
         }
 
-        sg->num_retain     = 0;   /* evict everything (BitBake: no sstate) */
+        sg->num_retain      = 0;    /* evict everything (BitBake: no sstate) */
         sg->traversal_order = NULL; /* raster order */
 
-        sg->latency = 0;
+        sg->latency = evaluate_subgraph(p, info, sg, NULL, 0);
         sol.num_subgraphs++;
     }
 
