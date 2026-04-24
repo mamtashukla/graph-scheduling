@@ -1,19 +1,22 @@
 CC      = gcc
 CFLAGS  = -O2 -Wall -Wextra -g
 LDFLAGS = -lcjson -lm
+CJSON_A = ../cJSON/build-static/libcjson.a
 
 TARGET  = mlsys
-SRC     = main.c
+SRC     = main.c baseline.c fusion.c
 
-.PHONY: all clean static test bench
+.PHONY: all clean dynamic test bench
 
+# Default: fully static binary — no runtime dependencies, safe to ship
 all: $(TARGET)
 
 $(TARGET): $(SRC)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	$(CC) $(CFLAGS) -static -o $@ $^ $(CJSON_A) -lm
 
-static: $(SRC)
-	$(CC) $(CFLAGS) -static -o $(TARGET) $^ -l:libcjson.a -lm
+# Dynamic build (requires libcjson installed on the runner)
+dynamic: $(SRC)
+	$(CC) $(CFLAGS) -o $(TARGET) $^ $(LDFLAGS)
 
 test: $(TARGET)
 	./$(TARGET) example_problem.json

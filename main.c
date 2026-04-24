@@ -1,95 +1,24 @@
 /*
- * mlsys — BitBake-inspired DAG Scheduler for MLSys Track A
+ * mlsys — BitBake-inspired DAG Scheduler 
  *
- * Philosophy: Just like BitBake decides how to order and group build tasks
- * to avoid re-fetching sstate caches,  how to order and group
- * tensor ops to minimize slow-memory traffic.
+ * main.c: JSON I/O (cJSON), graph metadata, subgraph evaluator, entry point.
  *
- *   BitBake DEPENDS edges      == tensor data edges
- *   Task grouping (configure+compile) == op fusion (ephemeral intermediates)
- *   sstate cache hit           == tensors_to_retain (data stays warm)
- *   Build artifact too large for /tmp == working set > fast_memory_capacity
- *
+ *   BitBake DEPENDS edges           == tensor data edges
+ *   Task grouping (configure+compile)== op fusion (ephemeral intermediates)
+ *   sstate cache hit                == tensors_to_retain (data stays warm)
+ *   Build artifact too large for /tmp== working set > fast_memory_capacity
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <math.h>
 #include <cjson/cJSON.h>
 
-#define MAX_TENSORS   512
-#define MAX_OPS       512
-#define MAX_SUBGRAPHS 1024
-#define MAX_FANIN     16    /* max inputs to one op  */
-#define MAX_FANOUT    16    /* max outputs from one op */
-#define MAX_SG_OPS    256   /* max ops fused into one subgraph */
-
-#define OP_POINTWISE  0
-#define OP_MATMUL     1
-
-/*
- * Structs for Tensor and Ops inspired by mlsys.h
- * https://github.com/yarongmu-google/MLSys/blob/main/mlsys.h
- */
-
-typedef struct {
-    long long width;
-    long long height;
-} Tensor;
-
-typedef struct {
-    int       op_type;               /* OP_POINTWISE or OP_MATMUL */
-    long long base_cost;
-    int       inputs[MAX_FANIN];
-    int       num_inputs;
-    int       outputs[MAX_FANOUT];
-    int       num_outputs;
-} Op;
-
-typedef struct {
-    long long w;
-    long long h;
-    long long k;
-} Granularity;
-
-typedef struct {
-    Tensor      tensors[MAX_TENSORS];
-    int         num_tensors;
-    Op          ops[MAX_OPS];
-    int         num_ops;
-    long long   fast_memory_capacity;
-    long long   slow_memory_bandwidth;
-    Granularity native_granularity;
-} Problem;
-
-typedef struct {
-    int         ops[MAX_SG_OPS];
-    int         num_ops;
-    Granularity gran;
-    int         tensors_to_retain[MAX_TENSORS];
-    int         num_retain;
-    long long  *traversal_order;    /* NULL = default raster order */
-    int         traversal_len;
-    double      latency;
-} Subgraph;
-
-typedef struct {
-    Subgraph subgraphs[MAX_SUBGRAPHS];
-    int      num_subgraphs;
-} Solution;
-
-/*
- * cJSON for reading Input.json
- *
- */
+#include "mlsys.h"
 
 static char *read_file_to_string(const char *filename) {
     FILE *f = fopen(filename, "r");
-    if (!f) {
-        fprintf(stderr, "ERROR: Cannot open file: %s\n", filename);
-        exit(1);
-    }
+    if (!f) { fprintf(stderr, "ERROR: Cannot open file: %s\n", filename); exit(1); }
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
     rewind(f);
@@ -101,7 +30,7 @@ static char *read_file_to_string(const char *filename) {
     return buf;
 }
 
-static Problem parse_problem(const char *filename) {
+Problem parse_problem(const char *filename) {
     Problem p;
     memset(&p, 0, sizeof(p));
 
@@ -130,9 +59,9 @@ static Problem parse_problem(const char *filename) {
     p.num_ops = cJSON_GetArraySize(j_inputs);
 
     for (int i = 0; i < p.num_ops; i++) {
-        cJSON *in_arr   = cJSON_GetArrayItem(j_inputs,  i);
-        cJSON *out_arr  = cJSON_GetArrayItem(j_outputs, i);
-        const char *tp  = cJSON_GetArrayItem(j_op_types, i)->valuestring;
+        cJSON *in_arr  = cJSON_GetArrayItem(j_inputs,  i);
+        cJSON *out_arr = cJSON_GetArrayItem(j_outputs, i);
+        const char *tp = cJSON_GetArrayItem(j_op_types, i)->valuestring;
 
         p.ops[i].base_cost = (long long)cJSON_GetArrayItem(j_base_costs, i)->valuedouble;
         p.ops[i].op_type   = (strcmp(tp, "MatMul") == 0) ? OP_MATMUL : OP_POINTWISE;
@@ -158,53 +87,43 @@ static Problem parse_problem(const char *filename) {
     return p;
 }
 
-typedef struct {
-    int producer;              
-    int consumers[MAX_OPS];
-    int num_consumers;
-    int is_graph_output;
-} TensorInfo;
-
-static void build_tensor_info(const Problem *p, TensorInfo *info) {
+void build_tensor_info(const Problem *p, TensorInfo *info) {
     memset(info, 0, sizeof(TensorInfo) * MAX_TENSORS);
     for (int t = 0; t < p->num_tensors; t++)
-        info[t].producer = -1;  
+        info[t].producer = -1;
     for (int i = 0; i < p->num_ops; i++) {
-      
         for (int n = 0; n < p->ops[i].num_outputs; n++) {
             int t = p->ops[i].outputs[n];
             info[t].producer = i;
         }
-    
         for (int n = 0; n < p->ops[i].num_inputs; n++) {
             int t = p->ops[i].inputs[n];
             info[t].consumers[info[t].num_consumers++] = i;
         }
     }
-
     for (int t = 0; t < p->num_tensors; t++)
         info[t].is_graph_output = (info[t].num_consumers == 0) ? 1 : 0;
 }
 
-static void print_problem_summary(const Problem *p, const TensorInfo *info) {
+void print_problem_summary(const Problem *p, const TensorInfo *info) {
     fprintf(stderr, "--------------------------------------\n");
     fprintf(stderr, " Problem summary\n");
     fprintf(stderr, "--------------------------------------\n");
-    fprintf(stderr, " Tensors : %d\n", p->num_tensors);
-    fprintf(stderr, " Ops     : %d\n", p->num_ops);
-    fprintf(stderr, " Fast mem: %lld\n", p->fast_memory_capacity);
+    fprintf(stderr, " Tensors  : %d\n", p->num_tensors);
+    fprintf(stderr, " Ops      : %d\n", p->num_ops);
+    fprintf(stderr, " Fast mem : %lld\n", p->fast_memory_capacity);
     fprintf(stderr, " Bandwidth: %lld\n", p->slow_memory_bandwidth);
     fprintf(stderr, " Native gran: [%lld, %lld]\n",
             p->native_granularity.w, p->native_granularity.h);
     fprintf(stderr, "\n Graph inputs (in slow DRAM at start):\n");
     for (int t = 0; t < p->num_tensors; t++)
         if (info[t].producer < 0)
-            fprintf(stderr, "   Tensor[%d]  %lld×%lld\n",
+            fprintf(stderr, "   Tensor[%d]  %lld\xc3\x97%lld\n",
                     t, p->tensors[t].width, p->tensors[t].height);
     fprintf(stderr, " Graph outputs (must end in slow DRAM):\n");
     for (int t = 0; t < p->num_tensors; t++)
         if (info[t].is_graph_output)
-            fprintf(stderr, "   Tensor[%d]  %lld×%lld\n",
+            fprintf(stderr, "   Tensor[%d]  %lld\xc3\x97%lld\n",
                     t, p->tensors[t].width, p->tensors[t].height);
     fprintf(stderr, " Ops:\n");
     for (int i = 0; i < p->num_ops; i++) {
@@ -213,17 +132,16 @@ static void print_problem_summary(const Problem *p, const TensorInfo *info) {
                 p->ops[i].base_cost);
         for (int n = 0; n < p->ops[i].num_inputs; n++)
             fprintf(stderr, "%d%s", p->ops[i].inputs[n],
-                    n+1 < p->ops[i].num_inputs ? "," : "");
+                    n + 1 < p->ops[i].num_inputs ? "," : "");
         fprintf(stderr, "] out=[");
         for (int n = 0; n < p->ops[i].num_outputs; n++)
             fprintf(stderr, "%d%s", p->ops[i].outputs[n],
-                    n+1 < p->ops[i].num_outputs ? "," : "");
+                    n + 1 < p->ops[i].num_outputs ? "," : "");
         fprintf(stderr, "]\n");
     }
-
 }
 
-static void write_solution(const Solution *sol, const char *filename) {
+void write_solution(const Solution *sol, const char *filename) {
     cJSON *root = cJSON_CreateObject();
 
     cJSON *sg_arr = cJSON_CreateArray();
@@ -261,7 +179,8 @@ static void write_solution(const Solution *sol, const char *filename) {
         } else {
             cJSON *t = cJSON_CreateArray();
             for (int j = 0; j < sol->subgraphs[i].traversal_len; j++)
-                cJSON_AddItemToArray(t, cJSON_CreateNumber(sol->subgraphs[i].traversal_order[j]));
+                cJSON_AddItemToArray(t, cJSON_CreateNumber(
+                    sol->subgraphs[i].traversal_order[j]));
             cJSON_AddItemToArray(trav_arr, t);
         }
     }
@@ -286,68 +205,21 @@ static void write_solution(const Solution *sol, const char *filename) {
     cJSON_Delete(root);
 }
 
-/*
- * Topo Sort: Kahn's Algo
- * Inspired by Bitbake Task Scheduler
- */
- 
-static void topo_sort(const Problem *p, const TensorInfo *info,
-                      int *topo_order, int *num_ordered) {
-    int indegree[MAX_OPS] = {0};
-    int queue[MAX_OPS];
-    int head = 0, tail = 0;
 
-    for (int i = 0; i < p->num_ops; i++) {
-        for (int n = 0; n < p->ops[i].num_inputs; n++) {
-            int t = p->ops[i].inputs[n];
-            if (info[t].producer >= 0) 
-                indegree[i]++;
-        }
-    }
-
-    for (int i = 0; i < p->num_ops; i++)
-        if (indegree[i] == 0)
-            queue[tail++] = i;
-
-    *num_ordered = 0;
-    while (head < tail) {
-        int op = queue[head++];
-        topo_order[(*num_ordered)++] = op;
-        for (int n = 0; n < p->ops[op].num_outputs; n++) {
-            int t = p->ops[op].outputs[n];
-            for (int c = 0; c < info[t].num_consumers; c++) {
-                int consumer_op = info[t].consumers[c];
-                indegree[consumer_op]--;
-                if (indegree[consumer_op] == 0)
-                    queue[tail++] = consumer_op;
-            }
-        }
-    }
-
-    if (*num_ordered != p->num_ops) {
-        fprintf(stderr, "ERROR: Topological sort failed — cycle in DAG? "
-                "Ordered %d of %d ops.\n", *num_ordered, p->num_ops);
-        exit(1);
-    }
-}
-
-static long long ceil_div(long long a, long long b) {
+long long ceil_div(long long a, long long b) {
     return (a + b - 1) / b;
 }
 
 /*
- * Evaluate the latency of one subgraph.
- * retained[0..num_retained-1] = tensor ids already resident in fast memory
- * from the previous subgraph (no load cost for them).
+ *
+ * latency = total_steps x max(compute_per_step, mem_bytes / bandwidth)
  */
-static double evaluate_subgraph(const Problem *p, const TensorInfo *info,
-                                 const Subgraph *sg,
-                                 const int *retained, int num_retained) {
-    /* Mark ops inside this subgraph */
+double evaluate_subgraph(const Problem *p, const TensorInfo *info,
+                          const Subgraph *sg,
+                          const int *retained, int num_retained) {
     int in_sg[MAX_OPS] = {0};
     for (int i = 0; i < sg->num_ops; i++) in_sg[sg->ops[i]] = 1;
 
-    /* Find output tensor shape and MatMul K depth in one pass */
     long long tensor_W = 0, tensor_H = 0, full_K = 1;
     for (int i = 0; i < sg->num_ops; i++) {
         int op = sg->ops[i];
@@ -357,8 +229,11 @@ static double evaluate_subgraph(const Problem *p, const TensorInfo *info,
                 int ext = info[t].is_graph_output;
                 for (int c = 0; !ext && c < info[t].num_consumers; c++)
                     ext = !in_sg[info[t].consumers[c]];
-                if (ext) { tensor_W = p->tensors[t].width;
-                           tensor_H = p->tensors[t].height; break; }
+                if (ext) {
+                    tensor_W = p->tensors[t].width;
+                    tensor_H = p->tensors[t].height;
+                    break;
+                }
             }
         }
         if (full_K == 1 && p->ops[op].op_type == OP_MATMUL)
@@ -378,13 +253,11 @@ static double evaluate_subgraph(const Problem *p, const TensorInfo *info,
     for (int i = 0; i < sg->num_ops; i++) {
         int op = sg->ops[i];
 
-        /* Compute cost per step */
         double cost = (double)p->ops[op].base_cost * spatial_overhead;
         if (p->ops[op].op_type == OP_MATMUL)
             cost *= (double)k / (double)full_K;
         compute += cost;
 
-        /* Boundary inputs: load from slow memory unless retained */
         for (int n = 0; n < p->ops[op].num_inputs; n++) {
             int t = p->ops[op].inputs[n];
             if (info[t].producer >= 0 && in_sg[info[t].producer]) continue;
@@ -397,7 +270,6 @@ static double evaluate_subgraph(const Problem *p, const TensorInfo *info,
                          : (double)(w * h);
         }
 
-        /* Boundary outputs: store to slow memory unless retained */
         for (int n = 0; n < p->ops[op].num_outputs; n++) {
             int t = p->ops[op].outputs[n];
             int ext = info[t].is_graph_output;
@@ -412,50 +284,15 @@ static double evaluate_subgraph(const Problem *p, const TensorInfo *info,
         }
     }
 
-    double mem_time = mem_bytes / (double)p->slow_memory_bandwidth;
+    double mem_time     = mem_bytes / (double)p->slow_memory_bandwidth;
     double lat_per_step = (compute > mem_time) ? compute : mem_time;
     return lat_per_step * (double)total_steps;
 }
 
-static Solution schedule_baseline(const Problem *p, const TensorInfo *info) {
-    Solution sol;
-    memset(&sol, 0, sizeof(sol));
-
-    int topo_order[MAX_OPS];
-    int num_ordered = 0;
-    topo_sort(p, info, topo_order, &num_ordered);
-
-    for (int i = 0; i < num_ordered; i++) {
-        int op = topo_order[i];
-        Subgraph *sg = &sol.subgraphs[sol.num_subgraphs];
-
-        sg->ops[0]   = op;
-        sg->num_ops  = 1;
-
-        sg->gran.w = p->native_granularity.w;
-        sg->gran.h = p->native_granularity.h;
-        if (p->ops[op].op_type == OP_MATMUL) {
-            int lhs_t = p->ops[op].inputs[0];
-            sg->gran.k = p->tensors[lhs_t].width;  /* full K = no split */
-        } else {
-            sg->gran.k = 1;
-        }
-
-        sg->num_retain      = 0;    /* evict everything (BitBake: no sstate) */
-        sg->traversal_order = NULL; /* raster order */
-
-        sg->latency = evaluate_subgraph(p, info, sg, NULL, 0);
-        sol.num_subgraphs++;
-    }
-
-    return sol;
-}
-
-
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: mlsys <problem.json> <result.json> \n");
-        fprintf(stderr, "  If solution.json is omitted, writes to stdout.\n");
+        fprintf(stderr, "Usage: mlsys <problem.json> [result.json]\n");
+        fprintf(stderr, "  If result.json is omitted, writes to stdout.\n");
         return 1;
     }
 
@@ -463,18 +300,14 @@ int main(int argc, char *argv[]) {
     const char *solution_file = (argc >= 3) ? argv[2] : NULL;
 
     Problem prob = parse_problem(problem_file);
-    Solution sol;
-    memset(&sol, 0, sizeof(sol));
 
-    /*Build graph metadata */
     TensorInfo tinfo[MAX_TENSORS];
     build_tensor_info(&prob, tinfo);
 
     print_problem_summary(&prob, tinfo);
-   
-    sol = schedule_baseline(&prob, tinfo);
+
+    Solution sol = schedule_fusion(&prob, tinfo);
 
     write_solution(&sol, solution_file);
-
     return 0;
 }
