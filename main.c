@@ -1,8 +1,8 @@
 /*
- * mlsys — BitBake-inspired DAG Scheduler for MLSys 2026 Track A
+ * mlsys — BitBake-inspired DAG Scheduler for MLSys Track A
  *
  * Philosophy: Just like BitBake decides how to order and group build tasks
- * to avoid re-fetching sstate caches, we decide how to order and group
+ * to avoid re-fetching sstate caches,  how to order and group
  * tensor ops to minimize slow-memory traffic.
  *
  *   BitBake DEPENDS edges      == tensor data edges
@@ -223,22 +223,90 @@ static void print_problem_summary(const Problem *p, const TensorInfo *info) {
 
 }
 
+static void write_solution(const Solution *sol, const char *filename) {
+    cJSON *root = cJSON_CreateObject();
+
+    cJSON *sg_arr = cJSON_CreateArray();
+    for (int i = 0; i < sol->num_subgraphs; i++) {
+        cJSON *sg = cJSON_CreateArray();
+        for (int j = 0; j < sol->subgraphs[i].num_ops; j++)
+            cJSON_AddItemToArray(sg, cJSON_CreateNumber(sol->subgraphs[i].ops[j]));
+        cJSON_AddItemToArray(sg_arr, sg);
+    }
+    cJSON_AddItemToObject(root, "subgraphs", sg_arr);
+
+    cJSON *gran_arr = cJSON_CreateArray();
+    for (int i = 0; i < sol->num_subgraphs; i++) {
+        cJSON *g = cJSON_CreateArray();
+        cJSON_AddItemToArray(g, cJSON_CreateNumber(sol->subgraphs[i].gran.w));
+        cJSON_AddItemToArray(g, cJSON_CreateNumber(sol->subgraphs[i].gran.h));
+        cJSON_AddItemToArray(g, cJSON_CreateNumber(sol->subgraphs[i].gran.k));
+        cJSON_AddItemToArray(gran_arr, g);
+    }
+    cJSON_AddItemToObject(root, "granularities", gran_arr);
+
+    cJSON *retain_arr = cJSON_CreateArray();
+    for (int i = 0; i < sol->num_subgraphs; i++) {
+        cJSON *r = cJSON_CreateArray();
+        for (int j = 0; j < sol->subgraphs[i].num_retain; j++)
+            cJSON_AddItemToArray(r, cJSON_CreateNumber(sol->subgraphs[i].tensors_to_retain[j]));
+        cJSON_AddItemToArray(retain_arr, r);
+    }
+    cJSON_AddItemToObject(root, "tensors_to_retain", retain_arr);
+
+    cJSON *trav_arr = cJSON_CreateArray();
+    for (int i = 0; i < sol->num_subgraphs; i++) {
+        if (sol->subgraphs[i].traversal_order == NULL) {
+            cJSON_AddItemToArray(trav_arr, cJSON_CreateNull());
+        } else {
+            cJSON *t = cJSON_CreateArray();
+            for (int j = 0; j < sol->subgraphs[i].traversal_len; j++)
+                cJSON_AddItemToArray(t, cJSON_CreateNumber(sol->subgraphs[i].traversal_order[j]));
+            cJSON_AddItemToArray(trav_arr, t);
+        }
+    }
+    cJSON_AddItemToObject(root, "traversal_orders", trav_arr);
+
+    cJSON *lat_arr = cJSON_CreateArray();
+    for (int i = 0; i < sol->num_subgraphs; i++)
+        cJSON_AddItemToArray(lat_arr, cJSON_CreateNumber(sol->subgraphs[i].latency));
+    cJSON_AddItemToObject(root, "subgraph_latencies", lat_arr);
+
+    char *json_str = cJSON_Print(root);
+    if (filename) {
+        FILE *f = fopen(filename, "w");
+        if (!f) { fprintf(stderr, "ERROR: Cannot write to %s\n", filename); exit(1); }
+        fputs(json_str, f);
+        fclose(f);
+        fprintf(stderr, "Solution written to: %s\n", filename);
+    } else {
+        puts(json_str);
+    }
+    free(json_str);
+    cJSON_Delete(root);
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: mlsys <problem.json> \n");
+        fprintf(stderr, "Usage: mlsys <problem.json> <result.json> \n");
         fprintf(stderr, "  If solution.json is omitted, writes to stdout.\n");
         return 1;
     }
 
     const char *problem_file  = argv[1];
+    const char *solution_file = (argc >= 3) ? argv[2] : NULL;
 
     Problem prob = parse_problem(problem_file);
+    Solution sol;
+    memset(&sol, 0, sizeof(sol));
 
     /*Build graph metadata */
     TensorInfo tinfo[MAX_TENSORS];
     build_tensor_info(&prob, tinfo);
 
     print_problem_summary(&prob, tinfo);
+    
+    write_solution(&sol, solution_file);
 
     return 0;
 }
