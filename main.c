@@ -331,6 +331,41 @@ static void topo_sort(const Problem *p, const TensorInfo *info,
     }
 }
 
+static Solution schedule_baseline(const Problem *p, const TensorInfo *info) {
+    Solution sol;
+    memset(&sol, 0, sizeof(sol));
+
+    int topo_order[MAX_OPS];
+    int num_ordered = 0;
+    topo_sort(p, info, topo_order, &num_ordered);
+
+    for (int i = 0; i < num_ordered; i++) {
+        int op = topo_order[i];
+        Subgraph *sg = &sol.subgraphs[sol.num_subgraphs];
+
+        sg->ops[0]   = op;
+        sg->num_ops  = 1;
+
+        sg->gran.w = p->native_granularity.w;
+        sg->gran.h = p->native_granularity.h;
+        if (p->ops[op].op_type == OP_MATMUL) {
+            int lhs_t = p->ops[op].inputs[0];
+            sg->gran.k = p->tensors[lhs_t].width;  /* full K = no split */
+        } else {
+            sg->gran.k = 1;
+        }
+
+        sg->num_retain     = 0;   /* evict everything (BitBake: no sstate) */
+        sg->traversal_order = NULL; /* raster order */
+
+        sg->latency = 0;
+        sol.num_subgraphs++;
+    }
+
+    return sol;
+}
+
+
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         fprintf(stderr, "Usage: mlsys <problem.json> <result.json> \n");
@@ -350,7 +385,9 @@ int main(int argc, char *argv[]) {
     build_tensor_info(&prob, tinfo);
 
     print_problem_summary(&prob, tinfo);
-    
+   
+    sol = schedule_baseline(&prob, tinfo);
+
     write_solution(&sol, solution_file);
 
     return 0;
