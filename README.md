@@ -9,49 +9,42 @@ spilling intermediates to slow DRAM.
 
 ## Dependencies
 
-| Library | Purpose | Package (Ubuntu/Debian) |
-|---------|---------|------------------------|
-| **[cJSON](https://github.com/davegamble/cjson)** | JSON parsing (problem input) and serialisation (solution output) | `libcjson-dev` |
-| **libm** | `math.h` (`ceil`, `log2`) | bundled with gcc |
+| Library | Purpose | Source |
+|---------|---------|--------|
+| **[cJSON](https://github.com/davegamble/cjson)** | JSON I/O | bundled under `../cJSON/` |
+| **libm** | math | bundled with gcc |
 
-Install cJSON on Ubuntu/Debian:
-
-```sh
-sudo apt install libcjson-dev
-```
-
-On Fedora/RHEL:
-
-```sh
-sudo dnf install cjson-devel
-```
+For the default static build no system packages are needed — cJSON source
+is already in this repo under `../cJSON/`.
 
 ---
 
 ## Building
 
-### Dynamic build (requires cJSON installed at runtime)
+`make` produces a **fully static binary** — cJSON, libc, and libm are all
+compiled in.  No runtime dependencies; the binary can be copied to any
+x86-64 Linux machine and run directly.
 
 ```sh
 make
 ```
 
-Produces `./mlsys` linked against the system `libcjson.so`.  Users must have
-`libcjson-dev` (or the equivalent runtime package) installed.
-
-### Fully static build (no runtime dependencies)
+First build the static cJSON library from the bundled source (one-time):
 
 ```sh
-make static
+cmake -S ../cJSON -B ../cJSON/build-static \
+      -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DENABLE_CJSON_TEST=OFF
+cmake --build ../cJSON/build-static
+make
 ```
 
-Produces `./mlsys` binary with cJSON compiled in.  This is
-what you want for submitting to the contest — the grader machine may not have
-cJSON installed.  Requires `libcjson.a` from the dev package:
+### Dynamic build (requires cJSON installed at runtime)
+
+If you prefer to link against the system cJSON (faster compile, not portable):
 
 ```sh
-sudo apt install libcjson-dev   # provides both .so and .a
-make static
+sudo apt install libcjson-dev
+make dynamic
 ```
 
 ---
