@@ -286,6 +286,51 @@ static void write_solution(const Solution *sol, const char *filename) {
     cJSON_Delete(root);
 }
 
+/*
+ * Topo Sort: Kahn's Algo
+ * Inspired by Bitbake Task Scheduler
+ */
+ 
+static void topo_sort(const Problem *p, const TensorInfo *info,
+                      int *topo_order, int *num_ordered) {
+    int indegree[MAX_OPS] = {0};
+    int queue[MAX_OPS];
+    int head = 0, tail = 0;
+
+    for (int i = 0; i < p->num_ops; i++) {
+        for (int n = 0; n < p->ops[i].num_inputs; n++) {
+            int t = p->ops[i].inputs[n];
+            if (info[t].producer >= 0) 
+                indegree[i]++;
+        }
+    }
+
+    for (int i = 0; i < p->num_ops; i++)
+        if (indegree[i] == 0)
+            queue[tail++] = i;
+
+    *num_ordered = 0;
+    while (head < tail) {
+        int op = queue[head++];
+        topo_order[(*num_ordered)++] = op;
+        for (int n = 0; n < p->ops[op].num_outputs; n++) {
+            int t = p->ops[op].outputs[n];
+            for (int c = 0; c < info[t].num_consumers; c++) {
+                int consumer_op = info[t].consumers[c];
+                indegree[consumer_op]--;
+                if (indegree[consumer_op] == 0)
+                    queue[tail++] = consumer_op;
+            }
+        }
+    }
+
+    if (*num_ordered != p->num_ops) {
+        fprintf(stderr, "ERROR: Topological sort failed — cycle in DAG? "
+                "Ordered %d of %d ops.\n", *num_ordered, p->num_ops);
+        exit(1);
+    }
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         fprintf(stderr, "Usage: mlsys <problem.json> <result.json> \n");
