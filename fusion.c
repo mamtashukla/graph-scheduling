@@ -1,7 +1,7 @@
 /*
  * fusion.c — Fusion scheduler.
  * BitBake analogy: group do_configure + do_compile only when the intermediate
- * build artefacts are private to that recipe AND fit in /tmp scratch space.
+ * build artifacts not really going on disk
  */
 
 #include <string.h>
@@ -87,16 +87,48 @@ long long working_set(const int *ops, int nops,
     return ws;
 }
 
-Granularity pick_gran(const int *ops, int nops, const Problem *p) {
-    Granularity g;
-    g.w = p->native_granularity.w;
-    g.h = p->native_granularity.h;
-    g.k = 1;
+Granularity pick_gran(const int *ops, int nops, const Problem *p,
+                      const TensorInfo *info) {
+    long long w = p->native_granularity.w;
+    long long h = p->native_granularity.h;
+    Granularity g = { w, h, 1 };
+
+    long long full_K = 0;
     for (int i = 0; i < nops; i++)
         if (p->ops[ops[i]].op_type == OP_MATMUL) {
-            g.k = p->tensors[p->ops[ops[i]].inputs[0]].width;
+            full_K = p->tensors[p->ops[ops[i]].inputs[0]].width;
             break;
         }
+
+    if (full_K > 0 && nops > 1) {
+        g.k = 1;
+        while ((w > 1 || h > 1) &&
+               working_set(ops, nops, p, info, g) > p->fast_memory_capacity) {
+            if (w > 1) w /= 2;
+            if (h > 1) h /= 2;
+            g.w = w;
+            g.h = h;
+        }
+    }
+
+    if (full_K == 0) {
+        g.k = 1;
+        return g;
+    }
+
+    if (nops == 1) {
+        g.k = full_K;
+        return g;
+    }
+
+    for (long long k = full_K; k >= 1; k = (k == 1 ? 0 : k / 2)) {
+        g.k = k;
+        if (working_set(ops, nops, p, info, g) <= p->fast_memory_capacity)
+            return g;
+        if (k == 1) break;
+    }
+    /* Nothing fits even at k=1 — fall back to full_K. */
+    g.k = full_K;
     return g;
 }
 
@@ -114,7 +146,7 @@ Solution schedule_fusion(const Problem *p, const TensorInfo *info) {
     Subgraph *sg = &sol.subgraphs[0];
     sg->ops[0]          = topo_order[0];
     sg->num_ops         = 1;
-    sg->gran            = pick_gran(sg->ops, 1, p);
+    sg->gran            = pick_gran(sg->ops, 1, p, info);
     sg->num_retain      = 0;
     sg->traversal_order = NULL;
     sol.num_subgraphs   = 1;
@@ -128,7 +160,7 @@ Solution schedule_fusion(const Problem *p, const TensorInfo *info) {
         for (int j = 0; j < nm; j++) merged[j] = sg->ops[j];
         merged[nm] = next;
 
-        Granularity mg = pick_gran(merged, nm + 1, p);
+        Granularity mg = pick_gran(merged, nm + 1, p, info);
 
         int can_merge =
             (nm < MAX_SG_OPS - 1)
@@ -143,7 +175,7 @@ Solution schedule_fusion(const Problem *p, const TensorInfo *info) {
             sg = &sol.subgraphs[sol.num_subgraphs++];
             sg->ops[0]          = next;
             sg->num_ops         = 1;
-            sg->gran            = pick_gran(sg->ops, 1, p);
+            sg->gran            = pick_gran(sg->ops, 1, p, info);
             sg->num_retain      = 0;
             sg->traversal_order = NULL;
         }

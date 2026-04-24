@@ -93,7 +93,8 @@ int       intermediates_are_safe(const int *ops_a, int na,
 long long working_set(const int *ops, int nops,
                       const Problem *p, const TensorInfo *info,
                       Granularity gran);
-Granularity pick_gran(const int *ops, int nops, const Problem *p);
+Granularity pick_gran(const int *ops, int nops, const Problem *p,
+                      const TensorInfo *info);
 Solution    schedule_fusion(const Problem *p, const TensorInfo *info);
 
 #endif /* MLSYS_H */
