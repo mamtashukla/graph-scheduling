@@ -5,7 +5,7 @@ LDFLAGS = -lcjson -lm
 TARGET  = mlsys
 SRC     = main.c
 
-.PHONY: all clean static test
+.PHONY: all clean static test bench
 
 all: $(TARGET)
 
@@ -17,6 +17,14 @@ static: $(SRC)
 
 test: $(TARGET)
 	./$(TARGET) example_problem.json
+
+bench: $(TARGET)
+	@for f in benchmarks/*.json; do \
+            echo ""; \
+            echo "=== $$f ==="; \
+            ./$(TARGET) $$f; \
+        done
+
 
 clean:
 	rm -f $(TARGET)
