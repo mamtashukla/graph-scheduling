@@ -101,9 +101,7 @@ Granularity pick_gran(const int *ops, int nops, const Problem *p) {
 }
 
 /*
- * Walk ops in topological order.  Maintain an open subgraph and attempt to
- * absorb each successive op.  Merge when all three guards pass; otherwise
- * emit the current subgraph and open a fresh one.
+ * Walk ops in topological order 
  */
 Solution schedule_fusion(const Problem *p, const TensorInfo *info) {
     Solution sol;
@@ -142,7 +140,6 @@ Solution schedule_fusion(const Problem *p, const TensorInfo *info) {
             sg->ops[sg->num_ops++] = next;
             sg->gran = mg;
         } else {
-            sg->latency = evaluate_subgraph(p, info, sg, NULL, 0);
             sg = &sol.subgraphs[sol.num_subgraphs++];
             sg->ops[0]          = next;
             sg->num_ops         = 1;
@@ -152,6 +149,37 @@ Solution schedule_fusion(const Problem *p, const TensorInfo *info) {
         }
     }
 
-    sg->latency = evaluate_subgraph(p, info, sg, NULL, 0);
+    for (int si = 0; si + 1 < sol.num_subgraphs; si++) {
+        Subgraph *cur = &sol.subgraphs[si];
+        Subgraph *nxt = &sol.subgraphs[si + 1];
+
+        int in_next[MAX_TENSORS] = {0};
+        for (int i = 0; i < nxt->num_ops; i++) {
+            int op = nxt->ops[i];
+            for (int n = 0; n < p->ops[op].num_inputs; n++)
+                in_next[p->ops[op].inputs[n]] = 1;
+        }
+
+        for (int i = 0; i < cur->num_ops; i++) {
+            int op = cur->ops[i];
+            for (int n = 0; n < p->ops[op].num_outputs; n++) {
+                int t = p->ops[op].outputs[n];
+                if (in_next[t] && cur->num_retain < MAX_TENSORS)
+                    cur->tensors_to_retain[cur->num_retain++] = t;
+            }
+        }
+    }
+
+    for (int si = 0; si < sol.num_subgraphs; si++) {
+        const int *prev_ret = NULL;
+        int        prev_nr  = 0;
+        if (si > 0) {
+            prev_ret = sol.subgraphs[si - 1].tensors_to_retain;
+            prev_nr  = sol.subgraphs[si - 1].num_retain;
+        }
+        sol.subgraphs[si].latency =
+            evaluate_subgraph(p, info, &sol.subgraphs[si], prev_ret, prev_nr);
+    }
+
     return sol;
 }
