@@ -11,7 +11,7 @@ spilling intermediates to slow DRAM.
 
 | Library | Purpose | Package (Ubuntu/Debian) |
 |---------|---------|------------------------|
-| **cJSON** | JSON parsing (problem input) and serialisation (solution output) | `libcjson-dev` |
+| **[cJSON](https://github.com/davegamble/cjson)** | JSON parsing (problem input) and serialisation (solution output) | `libcjson-dev` |
 | **libm** | `math.h` (`ceil`, `log2`) | bundled with gcc |
 
 Install cJSON on Ubuntu/Debian:
