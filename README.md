@@ -2,7 +2,7 @@
 
 A BitBake-inspired DAG scheduler for minimising slow-memory traffic in tensor
 workloads.  The core analogy: BitBake groups build tasks to avoid re-fetching
-sstate caches; this scheduler groups tensor ops into fused subgraphs to avoid
+sstate caches. This scheduler groups tensor ops into fused subgraphs to avoid
 spilling intermediates to slow DRAM.
 
 ---
